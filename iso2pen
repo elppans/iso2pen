@@ -1,0 +1,119 @@
+#!/bin/bash
+
+# Dependências:  
+# syslinux - Bootloader para BIOS  
+# mtools - Ferramentas para manipular sistemas de arquivos FAT  
+# parted - Utilitário para particionamento de discos  
+# grub-efi-amd64-bin - Bootloader para EFI (necessário para suporte UEFI)  
+
+# Função para verificar dependências
+check_dependencies() {
+    echo "Verificando dependências..."
+    MISSING=""
+
+    for pkg in syslinux mtools parted grub-install; do
+        if ! command -v $pkg &> /dev/null; then
+            echo "Dependência ausente: $pkg"
+            MISSING="$MISSING $pkg"
+        fi
+    done
+
+    if [ -n "$MISSING" ]; then
+        echo "Instale as dependências antes de continuar:"
+        echo "  Debian/Ubuntu: sudo apt install syslinux mtools parted grub-efi-amd64-bin"
+        echo "  Fedora: sudo dnf install syslinux mtools parted grub2-efi-x64"
+        echo "  Arch Linux: sudo pacman -S syslinux mtools parted grub"
+        exit 1
+    fi
+    # echo "Todas as dependências estão instaladas."
+}
+
+# Verifica se os argumentos foram passados corretamente
+if [ "$#" -ne 2 ]; then
+    echo "Uso: $0 <arquivo_iso> <dispositivo_pendrive>"
+    echo "Exemplo: $0 linux.iso /dev/sdb"
+    exit 1
+fi
+
+ISO="$1"
+DISK="$2"
+PART="${DISK}1"  # Primeira partição
+
+# Certifica-se de que o usuário é root
+if [ "$(id -u)" -ne 0 ]; then
+    echo "Este script precisa ser executado como root!"
+    exit 1
+fi
+
+# Verifica dependências antes de continuar
+check_dependencies
+
+echo "Todas as informações no dispositivo $DISK serão apagadas!"
+read -p "Deseja continuar? (s/n): " CONFIRM
+if [ "$CONFIRM" != "s" ]; then
+    echo "Operação cancelada."
+    exit 1
+fi
+
+# Desmonta qualquer partição montada
+umount ${PART}* 2>/dev/null
+
+# Cria uma nova tabela de partição MBR e formata como FAT32
+echo "Criando partição no pendrive..."
+parted -s "$DISK" mklabel msdos
+parted -s "$DISK" mkpart primary fat32 1MiB 100%
+mkfs.vfat -F 32 "$PART"
+
+# Instala o Syslinux na partição
+echo "Instalando Syslinux..."
+syslinux --install "$PART"
+dd if=/usr/lib/syslinux/mbr/mbr.bin of="$DISK" bs=440 count=1
+
+# Monta a ISO e o pendrive
+mkdir -p /mnt/iso /mnt/usb
+mount -o loop "$ISO" /mnt/iso
+mount "$PART" /mnt/usb
+
+# Copia os arquivos da ISO para o pendrive
+echo "Copiando arquivos da ISO..."
+cp -r /mnt/iso/* /mnt/usb/
+sync
+
+# Cria o arquivo de configuração do Syslinux
+echo "Criando syslinux.cfg..."
+cat <<EOF > /mnt/usb/syslinux.cfg
+DEFAULT linux
+LABEL linux
+    KERNEL /casper/vmlinuz
+    APPEND initrd=/casper/initrd boot=live quiet splash ---
+PROMPT 1
+TIMEOUT 50
+EOF
+
+# Suporte a EFI
+echo "Configurando suporte a EFI..."
+mkdir -p /mnt/usb/EFI/BOOT
+cp /mnt/iso/EFI/BOOT/* /mnt/usb/EFI/BOOT/ 2>/dev/null || echo "Arquivos EFI não encontrados na ISO."
+
+# Instala GRUB para EFI
+grub-install --target=x86_64-efi --efi-directory=/mnt/usb --removable --boot-directory=/mnt/usb/boot
+
+# Configuração do GRUB
+echo "Criando grub.cfg..."
+mkdir -p /mnt/usb/boot/grub
+cat <<EOF > /mnt/usb/boot/grub/grub.cfg
+set timeout=5
+set default=0
+
+menuentry "Linux Live" {
+    linux /casper/vmlinuz boot=live quiet splash
+    initrd /casper/initrd
+}
+EOF
+
+# Desmonta tudo
+umount /mnt/iso /mnt/usb
+rm -rf /mnt/iso /mnt/usb
+
+echo "Pendrive bootável criado com sucesso!"
+

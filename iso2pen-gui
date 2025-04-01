@@ -1,0 +1,124 @@
+#!/bin/bash
+
+# Função para verificar dependências
+check_dependencies() {
+    MISSING=""
+
+    for pkg in syslinux mtools parted grub-install zenity; do
+        if ! command -v $pkg &> /dev/null; then
+            MISSING="$MISSING $pkg"
+        fi
+    done
+
+    if [ -n "$MISSING" ]; then
+        zenity --error --title="Erro" --text="As seguintes dependências estão ausentes:\n$MISSING\n\nInstale-as antes de continuar."
+        exit 1
+    fi
+}
+
+# Verifica se o usuário é root
+if [ "$(id -u)" -ne 0 ]; then
+    zenity --error --title="Permissão negada" --text="Este script precisa ser executado como root!"
+    exit 1
+fi
+
+# Verifica dependências antes de continuar
+check_dependencies
+
+# Seleciona a ISO
+ISO=$(zenity --file-selection --title="Selecione a ISO" --file-filter="*.iso")
+if [ -z "$ISO" ]; then
+    zenity --error --title="Erro" --text="Nenhuma ISO foi selecionada."
+    exit 1
+fi
+
+# Lista os dispositivos disponíveis e permite escolher
+DISK=$(lsblk -dpno NAME,SIZE | grep -E "/dev/sd|/dev/mmcblk" | zenity --list --title="Selecione o Pendrive" --column="Dispositivo" --column="Tamanho" --hide-header)
+if [ -z "$DISK" ]; then
+    zenity --error --title="Erro" --text="Nenhum pendrive foi selecionado."
+    exit 1
+fi
+
+PART="${DISK}1"
+
+# Confirmação antes de apagar o disco
+zenity --question --title="Atenção!" --text="Todas as informações do dispositivo $DISK serão apagadas!\nDeseja continuar?"
+if [ $? -ne 0 ]; then
+    zenity --info --title="Operação cancelada" --text="Nenhuma alteração foi feita."
+    exit 1
+fi
+
+# Desmonta qualquer partição montada
+umount ${PART}* 2>/dev/null
+
+# Criando partição FAT32
+(
+echo "10"
+echo "# Criando partição no pendrive..."
+parted -s "$DISK" mklabel msdos
+parted -s "$DISK" mkpart primary fat32 1MiB 100%
+mkfs.vfat -F 32 "$PART"
+
+# Instalando Syslinux
+echo "30"
+echo "# Instalando Syslinux..."
+syslinux --install "$PART"
+dd if=/usr/lib/syslinux/mbr/mbr.bin of="$DISK" bs=440 count=1
+
+# Montando ISO e pendrive
+mkdir -p /mnt/iso /mnt/usb
+mount -o loop "$ISO" /mnt/iso
+mount "$PART" /mnt/usb
+
+# Copiando arquivos da ISO
+echo "60"
+echo "# Copiando arquivos da ISO..."
+cp -r /mnt/iso/* /mnt/usb/
+sync
+
+# Criando syslinux.cfg
+echo "70"
+echo "# Criando syslinux.cfg..."
+cat <<EOF > /mnt/usb/syslinux.cfg
+DEFAULT linux
+LABEL linux
+    KERNEL /casper/vmlinuz
+    APPEND initrd=/casper/initrd boot=live quiet splash ---
+PROMPT 1
+TIMEOUT 50
+EOF
+
+# Suporte a EFI
+echo "80"
+echo "# Configurando suporte a EFI..."
+mkdir -p /mnt/usb/EFI/BOOT
+cp /mnt/iso/EFI/BOOT/* /mnt/usb/EFI/BOOT/ 2>/dev/null || echo "⚠ Arquivos EFI não encontrados na ISO."
+
+# Instalando GRUB para EFI
+echo "90"
+echo "# Instalando GRUB para EFI..."
+grub-install --target=x86_64-efi --efi-directory=/mnt/usb --removable --boot-directory=/mnt/usb/boot
+
+# Criando grub.cfg
+echo "95"
+echo "# Criando grub.cfg..."
+mkdir -p /mnt/usb/boot/grub
+cat <<EOF > /mnt/usb/boot/grub/grub.cfg
+set timeout=5
+set default=0
+
+menuentry "Linux Live" {
+    linux /casper/vmlinuz boot=live quiet splash
+    initrd /casper/initrd
+}
+EOF
+
+# Finalizando
+echo "100"
+echo "# Finalizando..."
+umount /mnt/iso /mnt/usb
+rm -rf /mnt/iso /mnt/usb
+) | zenity --progress --title="Criando Pendrive Bootável" --text="Iniciando..." --percentage=0 --auto-close
+
+zenity --info --title="Concluído" --text="Pendrive bootável criado com sucesso!"
+
